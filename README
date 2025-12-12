@@ -18,8 +18,6 @@ Outputs tables, figures, and a summary report
 
 Data inputs
 
-The script expects the following CSV files in the data/ folder:
-
 hospital_visits.csv – daily aggregated visit counts
 
 air_quality.csv – daily PM2.5, ozone, NO2 (optionally by site)
