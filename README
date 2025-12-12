@@ -1,6 +1,8 @@
-Air Quality Hospital Surge Predictor
+Air Quality Hospital Surge Predictor - MAATANK ATHARV RISHI
 
-This project explores whether daily air quality and weather data can be used to predict short-term surges in hospital visits for respiratory and cardiac conditions. The goal is to turn routine environmental data into a simple next-day surge risk signal that could support hospital staffing and capacity planning.
+
+This project explores whether daily air quality and weather data can be used to predict short-term surges in hospital visits for respiratory and cardiac conditions. The goal is to turn routine environmental data into a simple next-day surge risk signal that could support hospital staffing and medicine planning.
+
 
 What this project does
 
@@ -10,11 +12,10 @@ Engineers lagged, rolling, and seasonal features
 
 Fits multiple count models (Negative Binomial and Zero-Inflated NB)
 
-Evaluates models using time-based cross validation
-
 Converts predicted visit counts into surge risk categories (low / medium / high)
 
 Outputs tables, figures, and a summary report
+
 
 Data inputs
 
