@@ -1,0 +1,365 @@
+# main imports we used
+import os
+import json
+import math
+import warnings
+from dataclasses import dataclass
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from statsmodels.genmod.families import NegativeBinomial
+from statsmodels.discrete.count_model import ZeroInflatedNegativeBinomialP
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from pandas.tseries.holiday import USFederalHolidayCalendar
+warnings.filterwarnings('ignore')
+np.random.seed(7)
+
+# set paths and folders
+BASE_PATH = r"C:\\Users\\Maatank\\Downloads\\AirQualityCapstone"
+DATA_PATH = os.path.join(BASE_PATH, 'data')
+OUT_PATH = os.path.join(BASE_PATH, 'outputs')
+FIG_PATH = os.path.join(OUT_PATH, 'figures')
+RUN_PATH = os.path.join(OUT_PATH, 'run')
+os.makedirs(DATA_PATH, exist_ok=True)
+os.makedirs(OUT_PATH, exist_ok=True)
+os.makedirs(FIG_PATH, exist_ok=True)
+os.makedirs(RUN_PATH, exist_ok=True)
+
+# keep config in one spot
+@dataclass
+class Config:
+    start_date = '2019-01-01'
+    end_date = '2023-12-31'
+    train_end = '2022-12-31'
+    surge_q = 0.80
+    max_lag = 3
+    roll_windows = (3, 7, 14)
+    cv_splits = 6
+    zcap = 5.0
+    ridge_c = 0.7
+    p_low = 0.20
+    p_high = 0.50
+    four_order = 3
+    year_period = 365
+cfg = Config()
+
+# small log print helper
+def log(msg):
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}')
+def read_csv_dates(path):
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if 'date' not in df.columns:
+        raise ValueError(f'date column missing: {path}')
+    df['date'] = pd.to_datetime(df['date'])
+    return df.sort_values('date').reset_index(drop=True)
+def to_lower_cols(df):
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
+
+# small cleanup helpers that we use later but you can also hardcode them -- Rishi jjust wanted them out the way at the start
+def safe_num(s):
+    return pd.to_numeric(s, errors='coerce').astype(float)
+def date_window(df, start, end):
+    if df.empty:
+        return df
+    m = (df['date'] >= pd.to_datetime(start)) & (df['date'] <= pd.to_datetime(end))
+    return df.loc[m].reset_index(drop=True)
+def zcap_series(s, zmax):
+    x = safe_num(s).copy()
+    mu = np.nanmean(x)
+    sd = np.nanstd(x)
+    if not np.isfinite(sd) or sd <= 0:
+        return x
+    z = (x - mu) / sd
+    hi = mu + zmax * sd
+    lo = mu - zmax * sd
+    x[z > zmax] = hi
+    x[z < -zmax] = lo
+    return x
+def holidays_set(start, end):
+    cal = USFederalHolidayCalendar()
+    hol = cal.holidays(start=start, end=end)
+    return set(pd.to_datetime(hol).date)
+
+# quick backfill if missing because we ran it on all our computers
+def fallback_hospital(dts):
+    dow = pd.Series(dts).dt.weekday.values
+    mon = pd.Series(dts).dt.month.values
+    base = 85 + 8 * (dow >= 5) + 7 * ((mon <= 2) | (mon >= 11))
+    wave = 6 * np.sin(np.linspace(0, 12 * np.pi, len(dts)))
+    eps = np.random.normal(0, 10, len(dts))
+    total = np.maximum(0, np.round(base + wave + eps)).astype(int)
+    return pd.DataFrame({'date': dts, 'total_visits': total})
+def fallback_air(dts):
+    mon = pd.Series(dts).dt.month.values
+    pm25 = 9 + 6 * ((mon <= 2) | (mon >= 11)) + np.random.normal(0, 2.0, len(dts))
+    ozone = 45 + 18 * ((mon >= 5) & (mon <= 9)) + np.random.normal(0, 4.0, len(dts))
+    no2 = 12 + 4 * (mon <= 3) + np.random.normal(0, 1.8, len(dts))
+    df = pd.DataFrame({'date': dts, 'pm25': pm25, 'ozone': ozone, 'no2': no2})
+    for c in ['pm25','ozone','no2']:
+        df[c] = df[c].clip(lower=0)
+    return df
+def fallback_weather(dts):
+    day = pd.Series(dts).dt.dayofyear.values.astype(float)
+    temp = 24 + 12 * np.sin(2 * np.pi * (day / 365.0 - 0.2)) + np.random.normal(0, 2.2, len(dts))
+    hum = 35 + 18 * np.sin(2 * np.pi * (day / 365.0 + 0.1)) + np.random.normal(0, 5.0, len(dts))
+    rain = np.maximum(0, np.random.gamma(0.6, 2.0, len(dts)) - 1.0)
+    df = pd.DataFrame({'date': dts, 'temp_c': temp, 'humidity': hum, 'rain_mm': rain})
+    df['humidity'] = df['humidity'].clip(0, 100)
+    return df
+
+# load and clean files. We use pandas and numpy but then switched to CredAL package -- but this has the one we originally used
+def load_hospital():
+    df = read_csv_dates(os.path.join(DATA_PATH, 'hospital_visits.csv'))
+    df = to_lower_cols(df) if not df.empty else df
+    if df.empty:
+        dts = pd.date_range(cfg.start_date, cfg.end_date, freq='D')
+        return fallback_hospital(dts)
+    if 'total_visits' not in df.columns:
+        if 'respiratory_visits' in df.columns and 'cardiac_visits' in df.columns:
+            df['total_visits'] = safe_num(df['respiratory_visits']) + safe_num(df['cardiac_visits'])
+        elif 'visits' in df.columns:
+            df['total_visits'] = safe_num(df['visits'])
+        else:
+            raise ValueError('need visits columns')
+    df['total_visits'] = safe_num(df['total_visits']).round().astype(int)
+    df = df[df['total_visits'] >= 0].reset_index(drop=True)
+    df = date_window(df, cfg.start_date, cfg.end_date)
+    return df.groupby('date')[['total_visits']].sum().reset_index()
+def load_air():
+    df = read_csv_dates(os.path.join(DATA_PATH, 'air_quality.csv'))
+    df = to_lower_cols(df) if not df.empty else df
+    if df.empty:
+        dts = pd.date_range(cfg.start_date, cfg.end_date, freq='D')
+        return fallback_air(dts)
+    keep = ['date'] + [c for c in ['pm25','ozone','no2','site_id'] if c in df.columns]
+    df = df[keep].copy()
+    for c in ['pm25','ozone','no2']:
+        if c in df.columns:
+            df[c] = safe_num(df[c])
+    df = date_window(df, cfg.start_date, cfg.end_date)
+    vals = [c for c in ['pm25','ozone','no2'] if c in df.columns]
+    df = df.groupby('date')[vals].mean().reset_index()
+    for c in vals:
+        df[c] = df[c].interpolate(limit=1, limit_direction='both').clip(lower=0)
+    return df
+def load_weather():
+    df = read_csv_dates(os.path.join(DATA_PATH, 'weather.csv'))
+    df = to_lower_cols(df) if not df.empty else df
+    if df.empty:
+        dts = pd.date_range(cfg.start_date, cfg.end_date, freq='D')
+        return fallback_weather(dts)
+    ren = {}
+    if 'temperature_c' in df.columns and 'temp_c' not in df.columns:
+        ren['temperature_c'] = 'temp_c'
+    if 'relative_humidity' in df.columns and 'humidity' not in df.columns:
+        ren['relative_humidity'] = 'humidity'
+    if ren:
+        df = df.rename(columns=ren)
+    keep = ['date'] + [c for c in ['temp_c','humidity','rain_mm'] if c in df.columns]
+    df = df[keep].copy()
+    for c in keep:
+        if c != 'date':
+            df[c] = safe_num(df[c])
+    df = date_window(df, cfg.start_date, cfg.end_date)
+    df = df.groupby('date').mean().reset_index()
+    for c in [c for c in keep if c != 'date']:
+        df[c] = df[c].interpolate(limit=1, limit_direction='both')
+    if 'humidity' in df.columns:
+        df['humidity'] = df['humidity'].clip(0, 100)
+    if 'rain_mm' in df.columns:
+        df['rain_mm'] = df['rain_mm'].clip(lower=0)
+    if 'temp_c' in df.columns:
+        df = df[(df['temp_c'] > -30) & (df['temp_c'] < 60)].reset_index(drop=True)
+    return df
+
+# build time features
+def make_fourier(dt, period, order):
+    t = (dt - dt.min()).dt.days.values.astype(float)
+    out = {}
+    for k in range(1, order + 1):
+        out[f'yr_sin{k}'] = np.sin(2.0 * np.pi * k * t / period)
+        out[f'yr_cos{k}'] = np.cos(2.0 * np.pi * k * t / period)
+    return pd.DataFrame(out)
+def add_calendar(df, hol):
+    df = df.copy()
+    df['dow'] = df['date'].dt.weekday
+    df['is_weekend'] = df['dow'].isin([5, 6]).astype(int)
+    df['is_holiday'] = df['date'].dt.date.map(lambda d: 1 if d in hol else 0).astype(int)
+    df['month'] = df['date'].dt.month
+    df['is_winter'] = df['month'].isin([11, 12, 1, 2]).astype(int)
+    return df
+
+# add lags and rolls -- Atharv had computed confidence itnervals because it was causing bugs
+def add_lags_rolls(df):
+    df = df.copy()
+    lag_cols = [c for c in ['pm25','ozone','no2'] if c in df.columns]
+    for c in lag_cols:
+        for k in range(1, cfg.max_lag + 1):
+            df[f'{c}_lag{k}'] = df[c].shift(k)
+    for c in ['pm25','ozone']:
+        if c in df.columns:
+            for w in cfg.roll_windows:
+                df[f'{c}_roll{w}'] = df[c].rolling(w, min_periods=w).mean()
+    return df
+def add_mix(df):
+    df = df.copy()
+    if 'pm25' in df.columns and 'temp_c' in df.columns:
+        df['pm25_x_temp'] = df['pm25'] * df['temp_c']
+    if 'ozone' in df.columns and 'temp_c' in df.columns:
+        df['ozone_x_temp'] = df['ozone'] * df['temp_c']
+    return df
+def add_constant(X):
+    return sm.add_constant(X, has_constant='add')
+
+# fit count models
+def nb_fit(y, X):
+    return sm.GLM(y, X, family=NegativeBinomial()).fit()
+def zinb_fit(y, X):
+    m = ZeroInflatedNegativeBinomialP(endog=y, exog=X, exog_infl=X, inflation='logit')
+    return m.fit(method='bfgs', maxiter=180, disp=0)
+def safe_pred(res, X):
+    p = np.asarray(res.predict(X), dtype=float)
+    p[~np.isfinite(p)] = np.nan
+    return p
+def rmse(y, p):
+    m = np.isfinite(y) & np.isfinite(p)
+    return float('nan') if m.sum() == 0 else math.sqrt(mean_squared_error(y[m], p[m]))
+def mae(y, p):
+    m = np.isfinite(y) & np.isfinite(p)
+    return float('nan') if m.sum() == 0 else float(mean_absolute_error(y[m], p[m]))
+
+# check surge scores (this has a penalizing term but we reported both with and without one)
+def surge_metrics(y_true, y_prob, y_hat):
+    out = {}
+    out['acc'] = accuracy_score(y_true, y_hat)
+    out['prec'] = precision_score(y_true, y_hat, zero_division=0)
+    out['rec'] = recall_score(y_true, y_hat, zero_division=0)
+    out['f1'] = f1_score(y_true, y_hat, zero_division=0)
+    out['auc'] = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float('nan')
+    return out
+def plot_pred(df, ycol, pcol, name):
+    plt.figure(figsize=(11, 5))
+    plt.plot(df['date'], df[ycol], label='actual')
+    plt.plot(df['date'], df[pcol], label='pred')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_PATH, f'{name}.png'))
+    plt.close()
+def plot_cm(cm, name):
+    plt.figure(figsize=(5, 4))
+    plt.imshow(cm, interpolation='nearest')
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, int(cm[i, j]), ha='center', va='center')
+    plt.xticks([0, 1], ['no', 'yes'])
+    plt.yticks([0, 1], ['no', 'yes'])
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_PATH, f'{name}.png'))
+    plt.close()
+def risk_bucket(p):
+    if not np.isfinite(p):
+        return 'unknown'
+    if p < cfg.p_low:
+        return 'low'
+    if p < cfg.p_high:
+        return 'medium'
+    return 'high'
+def run_cv_nb(df, ycol, Xcols, splits):
+    tscv = TimeSeriesSplit(n_splits=splits)
+    Xall = add_constant(df[Xcols].copy())
+    yall = df[ycol].astype(float).copy()
+    rows = []
+    for fold, (tr, va) in enumerate(tscv.split(df), start=1):
+        res = nb_fit(yall.iloc[tr], Xall.iloc[tr])
+        p = safe_pred(res, Xall.iloc[va])
+        rows.append({'fold': fold, 'rmse': rmse(yall.iloc[va].values, p), 'mae': mae(yall.iloc[va].values, p)})
+    return pd.DataFrame(rows)
+
+# fit risk prob model - Rishi made this and used extra covs to smooth
+def run_ridge(train, test, feature_cols):
+    Xtr = train[feature_cols].copy().replace([np.inf, -np.inf], np.nan)
+    Xte = test[feature_cols].copy().replace([np.inf, -np.inf], np.nan)
+    med = Xtr.median(numeric_only=True)
+    Xtr = Xtr.fillna(med)
+    Xte = Xte.fillna(med)
+    ytr = train['surge'].astype(int).values
+    m = LogisticRegression(C=cfg.ridge_c, penalty='l2', solver='lbfgs', max_iter=2000)
+    m.fit(Xtr.values, ytr)
+    return m.predict_proba(Xte.values)[:, 1]
+
+# Run model that uses the covs Atharv made and centers them using Rishis centering script
+def main():
+    log('starting run')
+    hosp = load_hospital()
+    air = load_air()
+    wx = load_weather()
+    df = hosp.merge(air, on='date', how='inner').merge(wx, on='date', how='inner')
+    df = df.sort_values('date').reset_index(drop=True)
+    hol = holidays_set(cfg.start_date, cfg.end_date)
+    df = add_calendar(df, hol)
+    df = pd.concat([df, make_fourier(df['date'], cfg.year_period, cfg.four_order)], axis=1)
+    for c in [c for c in ['pm25','ozone','no2','temp_c','humidity','rain_mm'] if c in df.columns]:
+        df[c] = zcap_series(df[c], cfg.zcap)
+    df = add_lags_rolls(df)
+    df = add_mix(df)
+    df = df.dropna().reset_index(drop=True)
+    surge_thr = float(df['total_visits'].quantile(cfg.surge_q))
+    df['surge'] = (df['total_visits'] >= surge_thr).astype(int)
+    cut = pd.to_datetime(cfg.train_end)
+    train = df[df['date'] <= cut].copy().reset_index(drop=True)
+    test = df[df['date'] > cut].copy().reset_index(drop=True)
+    if len(train) < 300 or len(test) < 30:
+        raise ValueError('not enough days after merge')
+    base_feats = ['is_weekend','is_holiday','is_winter'] + [c for c in df.columns if c.startswith('yr_')]
+    more_feats = [c for c in df.columns if (c.startswith('pm25') or c.startswith('ozone') or c.startswith('no2') or c in ['temp_c','humidity'])]
+    feature_cols = sorted(list(dict.fromkeys([c for c in (base_feats + more_feats) if c in df.columns])))
+    Xtr = add_constant(train[feature_cols].copy())
+    Xte = add_constant(test[feature_cols].copy())
+    yte = test['total_visits'].astype(float).values
+    cv_nb = run_cv_nb(train, 'total_visits', feature_cols, cfg.cv_splits)
+    cv_nb.to_csv(os.path.join(OUT_PATH, 'cv_nb.csv'), index=False)
+    nb_res = nb_fit(train['total_visits'].astype(float), Xtr)
+    nb_pred = safe_pred(nb_res, Xte)
+    zinb_res = zinb_fit(train['total_visits'].astype(float), Xtr)
+    zinb_pred = safe_pred(zinb_res, Xte)
+    test['nb_pred'] = nb_pred
+    test['zinb_pred'] = zinb_pred
+    test['best_pred'] = np.where(np.isfinite(test['zinb_pred'].values), test['zinb_pred'].values, test['nb_pred'].values)
+    test['best_hat'] = (test['best_pred'] >= surge_thr).astype(int)
+    y_true = test['surge'].astype(int).values
+    y_prob = np.nan_to_num(test['best_pred'].astype(float).values, nan=0.0)
+    met = surge_metrics(y_true, y_prob, test['best_hat'].values)
+    plot_pred(test, 'total_visits', 'best_pred', 'best_pred_vs_actual')
+    plot_cm(confusion_matrix(y_true, test['best_hat'].values), 'best_cm')
+    test['surge_prob'] = run_ridge(train, test, feature_cols)
+    test['risk'] = test['surge_prob'].apply(risk_bucket)
+
+# save outputs and report
+    test.to_csv(os.path.join(OUT_PATH, 'test_predictions.csv'), index=False)
+    df.to_csv(os.path.join(OUT_PATH, 'master_dataset.csv'), index=False)
+    report = {
+        'surge_threshold': surge_thr,
+        'best_rmse': rmse(yte, test['best_pred'].values),
+        'best_mae': mae(yte, test['best_pred'].values),
+        **met,
+        'cv_nb_mean_rmse': float(cv_nb['rmse'].mean()),
+        'feature_count': len(feature_cols),
+        'date_min': str(df['date'].min().date()),
+        'date_max': str(df['date'].max().date()),
+    }
+    with open(os.path.join(RUN_PATH, 'model_report.json'), 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2)
+    log('finished run')
+    return 0
+if __name__ == '__main__':
+    raise SystemExit(main())
